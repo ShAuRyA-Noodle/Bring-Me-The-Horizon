@@ -15,30 +15,46 @@ import { z } from "zod";
 import { components, internal } from "./_generated/api";
 import type { Id } from "./_generated/dataModel";
 
-const PRIMARY_MODEL = process.env.GROQ_MODEL_PRIMARY ?? "llama-3.3-70b-versatile";
-const FALLBACK_MODEL = process.env.GROQ_MODEL_FALLBACK ?? "openai/gpt-oss-120b";
+// gpt-oss-120b is trained specifically for tool use + instruction following
+// and holds format constraints better than llama-3.3-70b. We keep llama as
+// the fallback for speed if gpt-oss ever rate-limits or times out.
+const PRIMARY_MODEL = process.env.GROQ_MODEL_PRIMARY ?? "openai/gpt-oss-120b";
+const FALLBACK_MODEL = process.env.GROQ_MODEL_FALLBACK ?? "llama-3.3-70b-versatile";
 
-const DIRECTOR_INSTRUCTIONS = `You are a narrative director for visual learning. You plan how to explain concepts visually, then dispatch specialized sub-agents to render each frame.
+const MAX_FRAMES_PER_THREAD = 4;
 
-RULES:
-1. NEVER generate visual configs yourself. ALWAYS delegate to launchVisualAgent.
-2. Plan a narrative arc of 2-5 segments. Think: intro → build-up → key insight → summary → next actions.
-3. For each segment, call launchVisualAgent with a focused prompt explaining what that frame should show.
-4. ALWAYS end with a final launchVisualAgent call using skill "ui" that generates ActionCards for next steps.
-5. ALWAYS call done() as your very last action.
-6. Keep segment prompts concise and specific — the sub-agent handles the details.
+const DIRECTOR_INSTRUCTIONS = `You are a narrative director for visual learning. You plan short, high-density visual explanations by dispatching sub-agents.
 
-AVAILABLE SKILLS:
-- manim: Mathematical animations (3Blue1Brown style). Use for equations, graphs, geometry, proofs, step-by-step math.
-- diagram: System diagrams (Excalidraw). Use for concept maps, flowcharts, architecture, relationships.
-- particles: 3D particle simulations. Use for physics forces, waves, fields, molecular behavior.
-- ui: Interactive components. Use for summaries, comparisons, quizzes, AND always for the final "next actions" frame with ActionCards.
+HARD CONSTRAINTS (breaking these is a critical failure):
+- Total frames: EXACTLY 3 or 4. Never more. Never less. The runtime will reject attempts beyond 4.
+- NEVER generate visual configs yourself. ALWAYS delegate to launchVisualAgent.
+- For each question, dispatch at least ONE non-"ui" skill (manim, diagram, or particles) before the final ui summary — text-only responses are forbidden.
+- The LAST frame must be skill="ui" with ActionCards for next-step follow-ups.
+- After your last launchVisualAgent call, IMMEDIATELY call done(totalFrames=N). Do not call launchVisualAgent again after done().
 
-EXAMPLE NARRATIVE for "explain derivatives":
-1. launchVisualAgent(skill="manim", step=1, prompt="Show a curve f(x)=x² with a secant line between two points. Animate the second point approaching the first to show the limit concept. Narrate: A derivative measures the instantaneous rate of change.")
-2. launchVisualAgent(skill="manim", step=2, prompt="Show the tangent line at x=1 on f(x)=x². Display the formula f'(x)=2x. Narrate: The derivative at any point gives us the slope of the tangent line.")
-3. launchVisualAgent(skill="ui", step=3, prompt="Show a summary card with the derivative rules (power rule, chain rule, product rule) and 4 ActionCards: 'Quiz me on derivatives', 'Explain the chain rule in depth', 'Show real-world applications', 'Visualize integration (the reverse)'.")
-4. done(totalFrames=3)`;
+SKILL PICKING (choose the best medium, not the easiest):
+- manim: equations, graphs, geometry, proofs, step-by-step math. Prefer this for anything numeric.
+- diagram: concept maps, flowcharts, architecture, relationships, comparisons between ≥3 things. Prefer this when the answer has STRUCTURE.
+- particles: physics forces, waves, fields, molecular/atomic behavior, emergence.
+- ui: summaries, comparisons presented as cards, quizzes, AND the mandatory final frame with ActionCards.
+
+NARRATIVE SHAPE (4 frames, ideal):
+  1. non-ui skill — the core visual insight
+  2. non-ui skill — a second angle OR a deeper zoom
+  3. non-ui skill — a contrast, a consequence, or an application
+  4. ui — compact summary + 3-4 ActionCards for follow-ups
+
+OR (3 frames, minimum):
+  1. non-ui skill — the core insight
+  2. non-ui skill — a second angle
+  3. ui — summary + ActionCards
+
+EXAMPLE — "explain derivatives":
+  launchVisualAgent(skill="manim", step=1, prompt="Plot f(x)=x². Draw a secant line between (0.5, 0.25) and (2, 4), then animate the second point sliding toward the first so the secant becomes the tangent. Narrate: the derivative is the limit of the slope of that secant.")
+  launchVisualAgent(skill="manim", step=2, prompt="Show the tangent line at x=1 on f(x)=x² and display f'(x)=2x below. Narrate: the derivative rule 2x means the slope doubles as x grows.")
+  launchVisualAgent(skill="diagram", step=3, prompt="Draw a concept map connecting 'derivative' at the center to: limits, rate of change, tangent line, power rule, chain rule, and 'integration (inverse)'. Short labels. Narrate briefly why each connects.")
+  launchVisualAgent(skill="ui", step=4, prompt="Summary card with the power rule d/dx(xⁿ)=n·xⁿ⁻¹ plus 4 ActionCards: 'Quiz me on derivatives', 'Explain the chain rule', 'Show integration next', 'Real-world applications'.")
+  done(totalFrames=4)`;
 
 const launchVisualAgent = createTool({
   description: `Launch a sub-agent to render one visual frame. The sub-agent loads the skill, generates visual config, and saves the frame. Call this for each segment of your narrative.`,
@@ -58,6 +74,19 @@ const launchVisualAgent = createTool({
       .describe("Key narration phrases or tone guidance"),
   }),
   execute: async (ctx, args): Promise<string> => {
+    // Hard cap: if the model already emitted MAX_FRAMES_PER_THREAD frames for
+    // this thread, reject further launches. This short-circuits runaway
+    // open-weights planners that ignore the "max 4" instruction.
+    const existing = await ctx.runQuery(
+      internal.explanations.countNonDoneForThread,
+      { threadId: ctx.threadId! },
+    );
+    if (existing >= MAX_FRAMES_PER_THREAD) {
+      return `LIMIT_REACHED: already generated ${existing} frames (cap is ${MAX_FRAMES_PER_THREAD}). STOP calling launchVisualAgent and call done(totalFrames=${existing}) NOW.`;
+    }
+    if (args.step > MAX_FRAMES_PER_THREAD) {
+      return `REJECTED: step ${args.step} exceeds cap ${MAX_FRAMES_PER_THREAD}. Call done() now.`;
+    }
     try {
       await ctx.runAction(internal.agent.runSubAgent, {
         threadId: ctx.threadId!,
@@ -66,7 +95,7 @@ const launchVisualAgent = createTool({
         step: args.step,
         narrationHint: args.narrationHint,
       });
-      return `Frame ${args.step} (${args.skill}) generated successfully.`;
+      return `Frame ${args.step} (${args.skill}) saved. ${existing + 1 >= MAX_FRAMES_PER_THREAD ? 'You have now reached the cap — call done() next.' : `Continue or call done() if the narrative is complete.`}`;
     } catch (error) {
       return `Frame ${args.step} (${args.skill}) failed: ${error instanceof Error ? error.message : "unknown error"}. Continue with the next segment.`;
     }

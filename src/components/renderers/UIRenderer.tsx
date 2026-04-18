@@ -21,19 +21,38 @@ function renderChildren(children: JsonNode[] | string | undefined): ReactNode {
   return children.map((child, i) => renderNode(child, i))
 }
 
+// Loose alias map — open-weights models often emit plausible-but-wrong names.
+// Map them to the closest real component so the output still renders.
+const COMPONENT_ALIASES: Record<string, string> = {
+  h1: 'Heading', h2: 'Heading', h3: 'Heading', h4: 'Heading',
+  p: 'Text', paragraph: 'Text', span: 'Text',
+  div: 'Stack', section: 'Stack', container: 'Stack', row: 'Flex', column: 'Stack',
+  button: 'ActionCard', action: 'ActionCard', cta: 'ActionCard',
+  recap: 'Card', summary: 'Card', panel: 'Card', box: 'Card', callout: 'Alert',
+  group: 'Stack', wrapper: 'Stack',
+  label: 'Badge', tag: 'Badge', chip: 'Badge',
+}
+
 function renderNode(node: JsonNode | string, key: number): ReactNode {
   if (typeof node === 'string') return node
+  if (node == null) return null
 
   const { component, props = {}, children } = node
-  const Comp = COMPONENTS[component]
-  if (!Comp) {
+  const name = (component ?? '').trim()
+  const Resolved =
+    COMPONENTS[name] ??
+    (COMPONENT_ALIASES[name.toLowerCase()] ? COMPONENTS[COMPONENT_ALIASES[name.toLowerCase()]] : undefined)
+
+  if (!Resolved) {
+    // Graceful fallback: preserve the agent's content even if the component
+    // name is hallucinated. Users never see a cryptic "Unknown component" error.
     return (
-      <div key={key} className="text-red-400 text-sm">
-        Unknown component: {component}
+      <div key={key} className="space-y-3">
+        {renderChildren(children)}
       </div>
     )
   }
-  return <Comp key={key} {...props}>{renderChildren(children)}</Comp>
+  return <Resolved key={key} {...props}>{renderChildren(children)}</Resolved>
 }
 
 // ─── Layout Components ───

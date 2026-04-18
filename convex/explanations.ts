@@ -1,5 +1,5 @@
 // Explanation records with per-user ownership scoping.
-import { query, internalMutation } from "./_generated/server";
+import { query, internalMutation, internalQuery } from "./_generated/server";
 import { v } from "convex/values";
 import { getAuthUserId } from "@convex-dev/auth/server";
 
@@ -71,6 +71,18 @@ export const getByThread = query({
         return exp;
       })
     );
+  },
+});
+
+// Internal counter used by the director agent's hard frame cap.
+export const countNonDoneForThread = internalQuery({
+  args: { threadId: v.string() },
+  handler: async (ctx, { threadId }) => {
+    const rows = await ctx.db
+      .query("explanations")
+      .withIndex("by_thread", (q) => q.eq("threadId", threadId))
+      .collect();
+    return rows.filter((r) => r.skill !== "_done" && r.skill !== "intro").length;
   },
 });
 
