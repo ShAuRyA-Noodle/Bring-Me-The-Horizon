@@ -15,9 +15,9 @@ import {
  */
 function compileSafeMathFn(src: unknown): (x: number) => number {
   const expr = String(src ?? '').trim()
-  // Allowed: digits, . + - * / % ^ ( ) , whitespace, x, Math, and Math's members
-  const allowed = /^(?:[\s\d+\-*/%^(),.xX]|Math\.(?:abs|acos|acosh|asin|asinh|atan|atanh|atan2|cbrt|ceil|cos|cosh|exp|expm1|floor|hypot|log|log1p|log10|log2|max|min|pow|round|sign|sin|sinh|sqrt|tan|tanh|trunc|E|PI|LN2|LN10|LOG2E|LOG10E|SQRT2|SQRT1_2))+$/
-  // Simpler and stricter: strip all Math.X references, then ensure remaining is in the safe alphabet.
+  // Strip Math.X references, then verify the remainder is in the safe alphabet.
+  // The previous unified `allowed` regex was unused ("future extension" only)
+  // and tripped js/redos because of the `(?:A|B)+$` alternation under `+`.
   const stripped = expr.replace(
     /Math\.(?:abs|acos|acosh|asin|asinh|atan|atanh|atan2|cbrt|ceil|cos|cosh|exp|expm1|floor|hypot|log|log1p|log10|log2|max|min|pow|round|sign|sin|sinh|sqrt|tan|tanh|trunc|E|PI|LN2|LN10|LOG2E|LOG10E|SQRT2|SQRT1_2)\b/g,
     '',
@@ -25,7 +25,6 @@ function compileSafeMathFn(src: unknown): (x: number) => number {
   if (!/^[\s\d+\-*/%^(),.xX]*$/.test(stripped)) {
     throw new Error(`Rejected unsafe expression: ${expr}`)
   }
-  void allowed // ESLint: retained for future extension
   // eslint-disable-next-line no-new-func
   return new Function('x', `"use strict"; return (${expr});`) as (x: number) => number
 }
